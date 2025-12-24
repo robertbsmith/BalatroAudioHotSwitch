@@ -1,0 +1,106 @@
+# BalatroAudioHotSwitch
+# Enables seamless audio device switching when alt-tabbing back to the game
+# Requires OpenAL Soft 1.22.0+ (Windows: included OpenAL32.dll, Linux/macOS: install via package manager)
+
+[manifest]
+version = "1.0.0"
+dump_lua = true
+priority = 0
+
+# Patch 1: Add love.focus() handler to main.lua
+[[patches]]
+[patches.pattern]
+target = "main.lua"
+pattern = "function love.resize(w, h)"
+position = "before"
+payload = '''
+function love.focus(f)
+    if f and G and G.SOUND_MANAGER then
+        G.SOUND_MANAGER.channel:push({type = 'switch_device'})
+    end
+end
+
+'''
+match_indent = true
+times = 1
+
+# Patch 2: Add FFI device switching code to sound_manager.lua (after the jit.off line)
+[[patches]]
+[patches.pattern]
+target = "engine/sound_manager.lua"
+pattern = "if (love.system.getOS() == 'OS X' )and (jit.arch == 'arm64' or jit.arch == 'arm') then jit.off() end"
+position = "after"
+payload = '''
+
+-- BalatroAudioHotSwitch: FFI-based audio device switching via alcReopenDeviceSOFT
+local ffi = require("ffi")
+local openal = nil
+local alcReopenDeviceSOFT = nil
+local device_switch_initialized = false
+
+local function init_device_switch()
+    if device_switch_initialized then return alcReopenDeviceSOFT ~= nil end
+    device_switch_initialized = true
+
+    local ok = pcall(function()
+        ffi.cdef[[
+            typedef struct ALCdevice ALCdevice;
+            typedef struct ALCcontext ALCcontext;
+            typedef char ALCchar;
+            typedef int ALCint;
+            typedef int ALCboolean;
+
+            ALCcontext* alcGetCurrentContext(void);
+            ALCdevice* alcGetContextsDevice(ALCcontext *context);
+            void* alcGetProcAddress(ALCdevice *device, const ALCchar *funcname);
+            ALCboolean alcIsExtensionPresent(ALCdevice *device, const ALCchar *extname);
+        ]]
+        local os = love.system.getOS()
+        if os == "Windows" then
+            openal = ffi.load("OpenAL32")
+        elseif os == "OS X" then
+            openal = ffi.load("OpenAL.framework/OpenAL")
+        else
+            openal = ffi.load("openal")
+        end
+    end)
+    if not ok or not openal then return false end
+
+    local ctx = openal.alcGetCurrentContext()
+    if ctx == nil then return false end
+    local dev = openal.alcGetContextsDevice(ctx)
+    if dev == nil then return false end
+
+    if openal.alcIsExtensionPresent(dev, "ALC_SOFT_reopen_device") == 0 then return false end
+    local proc = openal.alcGetProcAddress(dev, "alcReopenDeviceSOFT")
+    if proc == nil then return false end
+    alcReopenDeviceSOFT = ffi.cast("ALCboolean (*)(ALCdevice*, const ALCchar*, const ALCint*)", proc)
+
+    return true
+end
+
+local function switch_audio_device()
+    if not init_device_switch() then return false end
+
+    local ctx = openal.alcGetCurrentContext()
+    if ctx == nil then return false end
+    local dev = openal.alcGetContextsDevice(ctx)
+    if dev == nil then return false end
+
+    return alcReopenDeviceSOFT(dev, nil, nil) ~= 0
+end
+'''
+match_indent = false
+times = 1
+
+# Patch 3: Add switch_device message handler (replace the placeholder "if false then")
+[[patches]]
+[patches.pattern]
+target = "engine/sound_manager.lua"
+pattern = "if false then elseif request.type == 'sound' then"
+position = "at"
+payload = '''if request.type == 'switch_device' then
+            switch_audio_device()
+        elseif request.type == 'sound' then'''
+match_indent = true
+times = 1
